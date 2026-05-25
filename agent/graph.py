@@ -1,13 +1,15 @@
 """
 The ReAct loop implemented as a LangGraph StateGraph.
 
-Node flow:
-  planner → code_gen → executor → reflector → (planner again OR summarizer)
+Node flow (Phase 2):
+  planner → code_gen → executor ──success──→ reflector → (planner OR summarizer)
+                            └──error──→ error_fixer → executor (retry, max 3x)
+                                              └──3rd failure──→ reflector anyway
 
-Why LangGraph StateGraph?
-  Each node gets the full state dict and returns only what changed.
-  LangGraph merges the updates — no boilerplate for passing data between steps.
-  Conditional edges let the reflector decide the next node dynamically.
+Why a dedicated error_fixer node instead of retrying inside executor?
+  Separation of concerns: executor just runs code and reports.
+  error_fixer is the only place that knows about retries — it holds the
+  error_count state and the traceback. Clean to test, clean to extend.
 """
 
 from typing import TypedDict, Annotated
@@ -34,6 +36,9 @@ class AgentState(TypedDict):
     iteration: int                              # How many ReAct loops we've done
     max_iterations: int                         # Safety limit to prevent infinite loops
     final_summary: str                          # Executive summary produced at the end
+    # Phase 2 additions
+    error_count: int                            # Retry attempts for the current task (resets each plan)
+    last_error: str                             # Traceback from the last failed execution
 
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
@@ -84,7 +89,8 @@ def planner_node(state: AgentState) -> dict:
     response = llm.invoke(messages)
     plan = response.content.strip()
     print(f"\n[PLANNER] → {plan}")
-    return {"current_plan": plan}
+    # Reset error counter — each new plan gets 3 fresh retry attempts
+    return {"current_plan": plan, "error_count": 0, "last_error": ""}
 
 
 # ── Node 2: Code Generator ────────────────────────────────────────────────────
@@ -125,12 +131,89 @@ def code_gen_node(state: AgentState) -> dict:
 def executor_node(state: AgentState) -> dict:
     """
     Runs the generated code and captures the output.
-    In Phase 1 this uses exec(). Phase 2 adds error recovery.
-    Phase 6 upgrades this to E2B sandbox.
+    Now stores the raw error in last_error so error_fixer can read it.
     """
     result = run_python_code(state["current_code"])
     print(f"\n[EXECUTOR]\n{result}")
-    return {"execution_result": result}
+
+    if result.startswith("ERROR:"):
+        return {"execution_result": result, "last_error": result}
+    return {"execution_result": result, "last_error": ""}
+
+
+# ── Node 3b: Error Fixer ──────────────────────────────────────────────────────
+
+def error_fixer_node(state: AgentState) -> dict:
+    """
+    Phase 2 addition. Called when executor produces an error.
+
+    Gets the broken code + traceback and asks the LLM to rewrite the code
+    so it avoids the specific error. Returns the fixed code so executor
+    can try again.
+
+    Why pass the full traceback?
+      The LLM needs the exact error type and line to fix it correctly.
+      "TypeError: unexpected keyword argument 'raw'" is much more useful
+      than "there was an error".
+    """
+    llm = _get_llm()
+    attempt = state["error_count"] + 1
+    print(f"\n[ERROR FIXER] Attempt {attempt}/3 — fixing error...")
+
+    messages = [
+        SystemMessage(content=(
+            "You are a Python debugging expert. A pandas code snippet failed.\n"
+            "Your job: rewrite the code to fix the error.\n"
+            "Rules:\n"
+            "- The variable `df` contains the DataFrame. `pd` is already imported.\n"
+            "- Use print() for ALL output.\n"
+            "- Write ONLY the fixed code, no markdown fences, no explanation.\n"
+            "- Keep the same analysis goal, just fix the bug."
+        )),
+        HumanMessage(content=(
+            f"Original task: {state['current_plan']}\n\n"
+            f"Broken code:\n{state['current_code']}\n\n"
+            f"Error traceback:\n{state['last_error']}\n\n"
+            "Rewrite the code to fix this error."
+        )),
+    ]
+
+    response = llm.invoke(messages)
+    fixed_code = response.content.strip()
+    fixed_code = fixed_code.removeprefix("```python").removeprefix("```").removesuffix("```").strip()
+
+    print(f"\n[ERROR FIXER] Fixed code:\n{fixed_code}")
+    return {
+        "current_code": fixed_code,
+        "error_count": state["error_count"] + 1,
+    }
+
+
+# ── Routing: after executor ───────────────────────────────────────────────────
+
+def after_executor(state: AgentState) -> str:
+    """
+    Conditional edge called after every executor run.
+
+    Decision tree:
+      - No error → go to reflector (normal path)
+      - Error + retries remaining → go to error_fixer
+      - Error + retries exhausted → go to reflector anyway (log it and move on)
+
+    MAX_RETRIES = 3: chosen to balance quality vs. Groq rate limits.
+    """
+    MAX_RETRIES = 3
+    is_error = state["execution_result"].startswith("ERROR:")
+
+    if not is_error:
+        return "reflector"
+
+    if state["error_count"] < MAX_RETRIES:
+        return "error_fixer"
+
+    # Exhausted retries — send to reflector which will log this as an ERROR insight
+    print(f"\n[ROUTER] Max retries reached for this task. Moving on.")
+    return "reflector"
 
 
 # ── Node 4: Reflector ─────────────────────────────────────────────────────────
@@ -221,27 +304,38 @@ def should_continue(state: AgentState) -> str:
 def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
-    # Register all nodes
+    # Register all nodes (error_fixer is new in Phase 2)
     graph.add_node("planner", planner_node)
     graph.add_node("code_gen", code_gen_node)
     graph.add_node("executor", executor_node)
+    graph.add_node("error_fixer", error_fixer_node)
     graph.add_node("reflector", reflector_node)
     graph.add_node("summarizer", summarizer_node)
 
-    # Fixed edges (always go this way)
+    # Fixed edges
     graph.set_entry_point("planner")
     graph.add_edge("planner", "code_gen")
     graph.add_edge("code_gen", "executor")
-    graph.add_edge("executor", "reflector")
+    graph.add_edge("error_fixer", "executor")  # fixer always goes back to executor
     graph.add_edge("summarizer", END)
 
-    # Conditional edge: reflector decides whether to loop or finish
+    # Phase 2: executor now routes conditionally (was a fixed edge in Phase 1)
+    graph.add_conditional_edges(
+        "executor",
+        after_executor,
+        {
+            "reflector": "reflector",
+            "error_fixer": "error_fixer",
+        },
+    )
+
+    # Reflector decides whether to loop or finish
     graph.add_conditional_edges(
         "reflector",
         should_continue,
         {
-            "planner": "planner",       # loop back
-            "summarizer": "summarizer", # exit
+            "planner": "planner",
+            "summarizer": "summarizer",
         },
     )
 
@@ -267,6 +361,8 @@ def run_analysis(file_path: str, max_iterations: int = 5) -> dict:
         "iteration": 0,
         "max_iterations": max_iterations,
         "final_summary": "",
+        "error_count": 0,
+        "last_error": "",
     }
 
     graph = build_graph()
