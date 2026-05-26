@@ -1,319 +1,153 @@
-# Autonomous Data Analyst Agent — Project Plan
+<div align="center">
 
-## What We're Building
+# 🔍 Autonomous Data Analyst Agent
 
-An AI agent that takes a CSV file or database connection, then autonomously:
-1. Explores the data (shape, types, nulls, distributions)
-2. Writes Python/SQL code to answer questions about it
-3. Executes that code in a safe sandbox
-4. Recovers from errors by reading the traceback and fixing the code
-5. Generates Plotly charts
-6. Produces an executive summary
+### Give it a CSV. It thinks, writes code, fixes its own bugs, and hands you insights.
 
-The key word is **autonomous** — the agent loops (Plan → Code → Execute → Reflect → Repeat)
-until it has enough insights, without human hand-holding between steps. This is a true ReAct
-(Reasoning + Acting) loop, not a fixed pipeline.
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://autonomous-data-analyst-agent-hun39rzqecosyvx5pqu3rg.streamlit.app/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-ReAct%20Loop-1C3C3C?style=for-the-badge&logo=chainlink&logoColor=white)](https://github.com/langchain-ai/langgraph)
+[![Groq](https://img.shields.io/badge/Groq-llama--3.1--8b-F55036?style=for-the-badge&logo=lightning&logoColor=white)](https://console.groq.com)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+
+</div>
 
 ---
 
-## Why This Stands Out (vs Open Source Alternatives)
+## What makes this different
 
-After researching the landscape (Vanna, EDAgent, OpenChatBI, Reasonlytics, Quelmap):
+Most "AI data analysis" tools are wrappers — you ask a question, it writes SQL, done. This agent is different in one key way: **it loops**.
 
-| What exists | What's missing |
+```
+Upload CSV
+    │
+    ▼
+🧠 PLAN  ──→  ✍️ WRITE CODE  ──→  ⚙️ RUN IT
+                                       │
+                              ┌────────┴────────┐
+                           success            error
+                              │                 │
+                              ▼                 ▼
+                         🪞 REFLECT        🔧 FIX IT  ──→  ⚙️ RUN AGAIN
+                              │                              (max 3 retries)
+                         ┌────┴────┐
+                    more to find   done
+                         │         │
+                         ▼         ▼
+                      🧠 PLAN   📋 SUMMARY
+```
+
+The agent decides what to investigate next based on what it already found. It writes its own pandas code, runs it, reads the error if it fails, rewrites the code, and tries again — all without you touching anything.
+
+---
+
+## Live demo
+
+**👉 [Try it here](https://autonomous-data-analyst-agent-hun39rzqecosyvx5pqu3rg.streamlit.app/)**
+
+Bring your own [free Groq API key](https://console.groq.com) (takes 2 minutes to get). Upload any CSV.
+
+---
+
+## The ReAct loop in action
+
+The UI shows the agent's internal reasoning in real time — collapsed by default, expandable like ChatGPT's "Thinking" panel:
+
+| Step | What you see |
+|------|-------------|
+| 🧠 **Plan** | "Analyze revenue by sales rep, group by region" |
+| ✍️ **Code** | `df.groupby('sales_rep')['revenue'].sum()` |
+| ⚙️ **Execute** | `Carol: $91,748 · Alice: $88,398 · Bob: $64,348` |
+| 🔧 **Error fix** | Auto-rewrites broken code from traceback (up to 3x) |
+| 🪞 **Insight** | "Carol is the top performer with $91k revenue" |
+| 📋 **Summary** | Full executive report with Key Findings + Recommendations |
+
+---
+
+## Why this is hard to build (and why it matters)
+
+| Naive approach | This agent |
 |---|---|
-| SQL-only agents (Vanna) | Combined pandas + SQL + ReAct loop |
-| Fixed 8-step pipelines (EDAgent) | Dynamic, hypothesis-driven exploration |
-| Local-only tools | Deployed, shareable demo |
-| No cost transparency | Token/cost meter per session |
-| No free-tier LLM support | Groq (free) + Gemini (free) + BYOK |
+| Single LLM call → answer | Iterative loop — each finding informs the next question |
+| Crashes on bad code | Reads its own traceback, rewrites, retries up to 3x |
+| Fixed pipeline (step 1 → step 2 → step 3) | Dynamic graph — agent decides its own next step |
+| Shows final answer only | Streams every node live — you watch it think |
+| One model hardcoded | BYOK: bring your own Groq/Gemini key from the sidebar |
 
 ---
 
-## Tech Stack — Why Each Piece
-
-### LangGraph
-- Chosen over simple LangChain chains because it gives us a **stateful graph** (nodes + edges).
-- We can model the ReAct loop as: `plan → code → execute → reflect → (loop or end)`.
-- Has built-in checkpointing so we can resume failed analyses.
-- Alternative considered: CrewAI (multi-agent but harder to control loop logic).
-
-### Groq (Free LLM API)
-- Groq runs Llama 3.1/Mixtral at **very fast inference, free tier**.
-- Google Gemini is the fallback free option.
-- Ollama is the fully local option (no API key needed).
-- All three will be supported. User picks in the sidebar.
-
-### Streamlit
-- Pure Python UI — no React, no FastAPI, no frontend/backend split.
-- One file can be both the UI and the logic.
-- Free deployment via Streamlit Community Cloud.
-- Alternative considered: Gradio (less flexible for custom layouts).
-
-### Python subprocess sandbox (Week 1-2) → E2B (future)
-- For the learning-focused incremental build, we start with `subprocess` + `restricted exec`.
-- E2B (production sandbox) is introduced later once the agent loop works.
-- This way we understand WHY a sandbox is needed before we use a managed one.
-
-### Plotly
-- Generates interactive charts that embed directly in Streamlit.
-- Agent outputs chart spec as JSON, Streamlit renders it.
-- Alternative considered: Matplotlib (static, less impressive for portfolio).
-
-### SQLAlchemy
-- Unified interface to talk to SQLite, PostgreSQL, MySQL from the same agent code.
-- Agent doesn't need to know which database it's talking to.
-
----
-
-## Architecture: The ReAct Loop
+## Tech stack
 
 ```
-User uploads CSV / connects DB
-         │
-         ▼
-  ┌─────────────┐
-  │   PLANNER   │  ← LLM decides: what to explore next?
-  └──────┬──────┘
-         │ plan
-         ▼
-  ┌─────────────┐
-  │  CODE GEN   │  ← LLM writes Python/SQL to answer the plan
-  └──────┬──────┘
-         │ code
-         ▼
-  ┌─────────────┐
-  │   EXECUTE   │  ← Run code in sandbox, capture output + errors
-  └──────┬──────┘
-         │ result / error
-         ▼
-  ┌─────────────┐
-  │   REFLECT   │  ← LLM reads output, decides: done? retry? next question?
-  └──────┬──────┘
-         │
-    ┌────┴────┐
-    │         │
-  loop      end
-    │         │
-    ▲         ▼
-    └──────  ┌──────────────┐
-             │  SUMMARIZER  │  ← Final executive summary + charts
-             └──────────────┘
+Agent orchestration  →  LangGraph (StateGraph with conditional edges)
+LLM inference        →  Groq API  (llama-3.1-8b-instant, free tier)
+Code execution       →  Python exec() in isolated namespace with stdout capture
+Data manipulation    →  Pandas
+UI + deployment      →  Streamlit Community Cloud
+```
+
+**Why LangGraph over a plain `while` loop?**
+LangGraph gives you stateful nodes, conditional routing, and checkpointing. The error-recovery branch (`executor → error_fixer → executor`) is a single conditional edge — clean, testable, extendable. A plain loop would need nested `try/except` and manual state threading.
+
+**Why Groq over OpenAI?**
+Free tier, fast inference (~500 tok/s on Llama 3.1), no credit card needed. The agent makes 4–8 LLM calls per run — latency matters in a loop.
+
+---
+
+## Run locally
+
+```bash
+git clone https://github.com/AbhAy120204/-Autonomous-Data-Analyst-Agent.git
+cd -Autonomous-Data-Analyst-Agent
+
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Add your Groq key
+echo "GROQ_API_KEY=gsk_..." > .env
+
+# Launch UI
+streamlit run app.py
+
+# Or CLI
+python main.py --file data/examples/sales.csv --iterations 5
 ```
 
 ---
 
-## Incremental Development Phases
-
-> **Rule**: Each phase produces a working, runnable thing. No phase is "just setup".
-
----
-
-### Phase 1 — Bare Minimum Working Agent (Week 1)
-
-**Goal**: A terminal script where you pass a CSV path and the agent prints insights.
-
-**What we build:**
-- `agent/tools.py` — two tools: `run_python_code(code)` and `load_csv(path)`
-- `agent/graph.py` — LangGraph graph with 4 nodes: planner, code_gen, executor, reflector
-- `main.py` — CLI entry point: `python main.py --file data.csv`
-- `requirements.txt`
-
-**What you learn in this phase:**
-- How LangGraph StateGraph works (nodes, edges, state dict)
-- How to define tools the LLM can call
-- What a ReAct loop looks like in code (not theory)
-
-**Success check**: `python main.py --file titanic.csv` prints 5+ insights about the data.
-
-**GitHub push**: `feat: working CLI agent with ReAct loop`
-
----
-
-### Phase 2 — Error Recovery Loop (Week 2)
-
-**Goal**: Agent doesn't crash when its code fails — it reads the error and fixes it.
-
-**What we add:**
-- `agent/nodes/executor.py` — captures stdout, stderr, tracebacks separately
-- Retry logic in the graph: executor → reflect → code_gen (on error, max 3 retries)
-- State tracks `error_count` and `last_error`
-- LLM prompt for "fix this code given this error"
-
-**What you learn:**
-- Why stateful graphs beat simple chains (you need to pass error context across nodes)
-- How to design prompts for error recovery
-- How `try/except` + `subprocess` works for safe code execution
-
-**Success check**: Deliberately break a CSV (missing column) — agent catches and corrects.
-
-**GitHub push**: `feat: error recovery with retry loop`
-
----
-
-### Phase 3 — Streamlit UI (Week 3)
-
-**Goal**: Everything Phase 1+2 does, but in a browser with a drag-and-drop file upload.
-
-**What we add:**
-- `app.py` — Streamlit app
-- File uploader widget → saves to temp path → triggers agent
-- `st.expander` for each agent step (shows plan, code, output)
-- Agent thoughts stream to UI in real-time using `st.empty()` + generator pattern
-- LLM selector in sidebar (Groq / Gemini / Ollama)
-
-**What you learn:**
-- How Streamlit session state works (keeping agent output across reruns)
-- How to stream LLM output to Streamlit (generator + `st.write_stream`)
-- Why UI feedback matters for agentic systems (user needs to see the loop)
-
-**Success check**: Upload CSV in browser → watch agent think step by step → see insights.
-
-**GitHub push**: `feat: streamlit UI with streaming agent thoughts`
-
----
-
-### Phase 4 — Visualizations (Week 4)
-
-**Goal**: Agent generates and displays Plotly charts alongside text insights.
-
-**What we add:**
-- `agent/tools.py` — new tool: `generate_chart(df, chart_type, x, y, title)`
-- Agent prompted to call chart tool when it has a visualization-worthy finding
-- Charts serialized as JSON in agent state → rendered by Streamlit via `st.plotly_chart`
-- Agent picks chart type based on data (bar for categorical, line for time-series, etc.)
-
-**What you learn:**
-- How to design tools that return structured data (not just text)
-- How to pass complex objects (chart JSON) through LangGraph state
-- Plotly's JSON schema for chart specs
-
-**Success check**: Agent produces at least 2 charts per CSV automatically.
-
-**GitHub push**: `feat: automatic chart generation`
-
----
-
-### Phase 5 — SQL + Database Support (Week 5)
-
-**Goal**: Connect a SQLite/PostgreSQL database instead of a CSV.
-
-**What we add:**
-- `agent/tools.py` — `run_sql_query(query)` tool using SQLAlchemy
-- Schema introspection tool: `get_table_schema()` → agent knows column names/types
-- Sidebar: user enters connection string or uploads SQLite file
-- Agent decides tool to use (pandas vs SQL) based on data source type
-
-**What you learn:**
-- How SQLAlchemy abstracts different databases
-- Why schema introspection is critical for text-to-SQL agents
-- How to give an agent "awareness" of its environment through tools
-
-**Success check**: Connect to a SQLite DB → agent writes and runs SQL → shows results.
-
-**GitHub push**: `feat: SQL and database support`
-
----
-
-### Phase 6 — Evaluation + Observability (Week 6)
-
-**Goal**: Know whether the agent is actually good, with numbers to prove it.
-
-**What we add:**
-- `evals/` folder with 5 benchmark CSVs (Titanic, Iris, Sales, Weather, Finance)
-- Each benchmark has a `ground_truth.json` with expected insights
-- `evals/run_benchmarks.py` — runs agent on all 5, scores insight coverage
-- LangSmith or Maxim tracing integration (free tier)
-- Token usage counter displayed in Streamlit sidebar
-
-**What you learn:**
-- How to evaluate LLM agent output (not just "does it run" but "is it correct")
-- What LLMOps observability means (tracing every node, every token)
-- Why evaluation matters for portfolio projects (shows engineering rigor)
-
-**GitHub push**: `feat: eval framework + observability`
-
----
-
-### Phase 7 — BYOK + Multi-Model Support (Week 7)
-
-**Goal**: Any user can bring their own API key and choose their model.
-
-**What we add:**
-- Streamlit sidebar: model selector (Groq / Gemini / Ollama / OpenAI)
-- API key input field (stored in `st.session_state`, never persisted to disk)
-- `agent/llm_factory.py` — returns the right LangChain LLM based on selection
-- Fallback chain: if Groq fails → try Gemini → warn user
-
-**What you learn:**
-- How LangChain's LLM abstraction works (swap providers with one line)
-- Why BYOK matters for deployed apps (you can't pay for everyone's queries)
-- How to handle secrets safely in Streamlit
-
-**GitHub push**: `feat: multi-model support with BYOK`
-
----
-
-### Phase 8 — Deploy + Portfolio Polish (Week 8)
-
-**Goal**: Live public URL. Resume-ready README. Demo video.
-
-**What we add:**
-- `requirements.txt` pinned versions
-- `.streamlit/config.toml` for theme + deployment settings
-- Deploy to Streamlit Community Cloud (free, connects to GitHub repo)
-- README: architecture diagram, demo GIF, benchmark results, "How to run" section
-- 3 example analyses (Titanic, Sales data, Iris) as screenshots in README
-
-**What you learn:**
-- How Streamlit Cloud deployment works (it just reads your repo)
-- How to write a portfolio README that communicates impact
-
----
-
-## Repository Structure (Final Target)
+## Project structure
 
 ```
-autonomous-data-analyst-agent/
-│
 ├── agent/
-│   ├── __init__.py
-│   ├── graph.py          # LangGraph state machine (the ReAct loop)
-│   ├── nodes/
-│   │   ├── planner.py    # Decides what question to answer next
-│   │   ├── code_gen.py   # Writes Python/SQL code
-│   │   ├── executor.py   # Runs code safely, captures output/errors
-│   │   ├── reflector.py  # Reads output, decides next action
-│   │   └── summarizer.py # Final executive summary
-│   ├── tools.py          # Agent-callable tools (run_code, load_csv, chart, sql)
-│   └── llm_factory.py    # Returns LLM based on user's model choice
-│
-├── evals/
-│   ├── benchmarks/       # Test CSVs with known expected insights
-│   ├── ground_truth/     # Expected outputs per benchmark
-│   └── run_benchmarks.py # Evaluation script
-│
-├── data/
-│   └── examples/         # Sample datasets for demo
-│
-├── app.py                # Streamlit UI (entry point for web)
-├── main.py               # CLI entry point (entry point for terminal)
-├── requirements.txt
-├── .streamlit/
-│   └── config.toml
-└── README.md
+│   ├── graph.py      # LangGraph StateGraph — the ReAct loop
+│   └── tools.py      # load_csv, run_python_code, get_dataframe_info
+├── app.py            # Streamlit UI (streaming, collapsible thinking panel)
+├── main.py           # CLI entry point
+└── data/examples/    # Sample datasets
 ```
 
 ---
 
-## Current Status
+## Roadmap
 
-- [x] Plan created
-- [ ] Phase 1: CLI agent (Week 1)
-- [ ] Phase 2: Error recovery (Week 2)
-- [ ] Phase 3: Streamlit UI (Week 3)
-- [ ] Phase 4: Visualizations (Week 4)
-- [ ] Phase 5: SQL support (Week 5)
-- [ ] Phase 6: Evals + Observability (Week 6)
-- [ ] Phase 7: BYOK + Multi-model (Week 7)
-- [ ] Phase 8: Deploy + Polish (Week 8)
+- [x] Phase 1 — Core ReAct loop (plan → code → execute → reflect)
+- [x] Phase 2 — Error recovery (auto-fix broken code, 3 retries)
+- [x] Phase 3 — Streamlit UI with live streaming
+- [ ] Phase 4 — Plotly chart generation
+- [ ] Phase 5 — SQL / database support
+- [ ] Phase 6 — Eval framework + LLM observability
+- [ ] Phase 7 — Multi-model BYOK (Groq / Gemini / Ollama)
+
+---
+
+## Get a free Groq API key
+
+1. Go to [console.groq.com](https://console.groq.com)
+2. Sign up (free, no credit card)
+3. Create an API key
+4. Paste it in the sidebar → Run analysis
+
+---
+
+<div align="center">
+Built by <a href="https://github.com/AbhAy120204">Abhay Tiwari</a> · LangGraph + Groq + Streamlit
+</div>
