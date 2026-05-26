@@ -3,3 +3,4 @@ langchain-groq
 langchain-core
 pandas
 python-dotenv
+streamlit

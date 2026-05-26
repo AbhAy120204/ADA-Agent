@@ -43,21 +43,36 @@ class AgentState(TypedDict):
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
 
-def _get_llm() -> ChatGroq:
+def _get_llm(api_key: str | None = None) -> ChatGroq:
     """
-    Returns a Groq LLM. We use llama-3.1-8b-instant because:
-    - It's fast (low latency for iterative loops)
-    - Free tier on Groq
-    - Good enough for code generation and analysis reasoning
+    Returns a Groq LLM.
+    api_key: if provided (from Streamlit sidebar), uses it directly.
+             Otherwise falls back to GROQ_API_KEY env variable.
     """
     import os
     from dotenv import load_dotenv
     load_dotenv()
+    key = api_key or os.getenv("GROQ_API_KEY")
     return ChatGroq(
         model="llama-3.1-8b-instant",
-        temperature=0,  # 0 = deterministic, important for code generation
-        api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0,
+        api_key=key,
     )
+
+
+# Module-level key store so all nodes in a run share the same key
+_runtime_api_key: str | None = None
+
+
+def set_api_key(key: str) -> None:
+    """Called by Streamlit before starting a run to set the user's key."""
+    global _runtime_api_key
+    _runtime_api_key = key
+
+
+def _llm() -> ChatGroq:
+    """Shorthand used by all nodes — picks up the runtime key if set."""
+    return _get_llm(_runtime_api_key)
 
 
 # ── Node 1: Planner ───────────────────────────────────────────────────────────
@@ -67,7 +82,7 @@ def planner_node(state: AgentState) -> dict:
     Looks at what we know so far (data summary + collected insights)
     and decides the next specific question to investigate.
     """
-    llm = _get_llm()
+    llm = _llm()
 
     existing_insights = "\n".join(state["insights"]) if state["insights"] else "None yet."
 
@@ -100,7 +115,7 @@ def code_gen_node(state: AgentState) -> dict:
     Takes the planner's task description and writes executable Python code.
     The code has access to `df` (the loaded DataFrame) and `pd` (pandas).
     """
-    llm = _get_llm()
+    llm = _llm()
 
     messages = [
         SystemMessage(content=(
@@ -156,7 +171,7 @@ def error_fixer_node(state: AgentState) -> dict:
       "TypeError: unexpected keyword argument 'raw'" is much more useful
       than "there was an error".
     """
-    llm = _get_llm()
+    llm = _llm()
     attempt = state["error_count"] + 1
     print(f"\n[ERROR FIXER] Attempt {attempt}/3 — fixing error...")
 
@@ -226,7 +241,7 @@ def reflector_node(state: AgentState) -> dict:
 
     Does NOT route — routing is handled by the conditional edge below.
     """
-    llm = _get_llm()
+    llm = _llm()
 
     messages = [
         SystemMessage(content=(
@@ -258,7 +273,7 @@ def summarizer_node(state: AgentState) -> dict:
     Called once when the loop ends. Combines all insights into a
     structured executive summary.
     """
-    llm = _get_llm()
+    llm = _llm()
 
     insights_text = "\n".join(state["insights"])
 
@@ -342,16 +357,9 @@ def build_graph() -> StateGraph:
     return graph.compile()
 
 
-def run_analysis(file_path: str, max_iterations: int = 5) -> dict:
-    """
-    Entry point for running the full analysis pipeline.
-    Returns the final state with all insights and the summary.
-    """
-    # Step 1: load the CSV so tools.py has it in memory
+def _build_initial_state(file_path: str, max_iterations: int) -> AgentState:
     data_summary = load_csv(file_path)
-    print(f"[INIT] {data_summary}\n")
-
-    initial_state: AgentState = {
+    return {
         "file_path": file_path,
         "data_summary": data_summary,
         "current_plan": "",
@@ -365,6 +373,37 @@ def run_analysis(file_path: str, max_iterations: int = 5) -> dict:
         "last_error": "",
     }
 
+
+def stream_analysis(file_path: str, max_iterations: int = 5, api_key: str | None = None):
+    """
+    Generator used by Streamlit for live updates.
+
+    graph.stream() yields {node_name: state_snapshot} after every node fires.
+    Streamlit calls next() on this generator inside a loop and updates the UI
+    incrementally — the user sees each step as it happens instead of waiting
+    for the full run to complete.
+
+    Yields dicts like:
+      {"node": "planner",  "state": {...}}
+      {"node": "code_gen", "state": {...}}
+      ...
+    """
+    if api_key:
+        set_api_key(api_key)
+
+    initial_state = _build_initial_state(file_path, max_iterations)
     graph = build_graph()
-    final_state = graph.invoke(initial_state)
-    return final_state
+
+    for chunk in graph.stream(initial_state):
+        # chunk = {node_name: full_state_after_that_node}
+        node_name = next(iter(chunk))
+        state = chunk[node_name]
+        yield {"node": node_name, "state": state}
+
+
+def run_analysis(file_path: str, max_iterations: int = 5) -> dict:
+    """CLI entry point — blocks until complete, returns final state."""
+    initial_state = _build_initial_state(file_path, max_iterations)
+    print(f"[INIT] {initial_state['data_summary']}\n")
+    graph = build_graph()
+    return graph.invoke(initial_state)

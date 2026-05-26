@@ -269,8 +269,6 @@ User uploads CSV / connects DB
 - How Streamlit Cloud deployment works (it just reads your repo)
 - How to write a portfolio README that communicates impact
 
-**GitHub push**: `feat: deployment config + v1.0 release tag`
-
 ---
 
 ## Repository Structure (Final Target)
@@ -305,28 +303,6 @@ autonomous-data-analyst-agent/
 │   └── config.toml
 └── README.md
 ```
-
----
-
-## Rules for This Build
-
-1. **Explain before adding**: Before introducing any new library or pattern, we discuss why it's needed.
-2. **Working at each phase**: Every phase ends with something you can run.
-3. **Incremental GitHub pushes**: One focused commit per phase, clearly labeled.
-4. **No premature abstraction**: Don't build `llm_factory.py` in Phase 1. Add it when needed.
-5. **Learning notes**: Key concepts explained inline as comments in the code.
-
----
-
-## Free API Resources
-
-| Provider | Free Tier | How to Get Key |
-|---|---|---|
-| Groq | 14,400 req/day, fast Llama 3.1 | console.groq.com |
-| Google Gemini | 15 req/min, Gemini 1.5 Flash | aistudio.google.com |
-| Ollama | Unlimited (runs locally) | ollama.com |
-| Streamlit Cloud | Free deploy for public repos | share.streamlit.io |
-| LangSmith | Free tier (tracing) | smith.langchain.com |
 
 ---
 
