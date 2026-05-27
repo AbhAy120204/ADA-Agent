@@ -4,3 +4,4 @@ langchain-core
 pandas
 python-dotenv
 streamlit
+plotly

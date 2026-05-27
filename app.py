@@ -2,28 +2,26 @@
 Streamlit UI for the Autonomous Data Analyst Agent.
 
 Key Streamlit concepts used here:
-  st.session_state  — persists values across reruns (Streamlit reruns the whole
-                      script on every interaction, so without this, results vanish)
-  st.empty()        — a placeholder that can be overwritten in-place (used for
-                      live updates while the agent is running)
-  graph.stream()    — yields state after each node, which we render incrementally
+  st.session_state  — persists values across reruns
+  st.status()       — collapsible "thinking" panel with spinner
+  st.plotly_chart() — renders Plotly JSON as interactive charts
+  graph.stream()    — yields state after each node for live updates
 """
 
+import json
 import tempfile
 import os
 import streamlit as st
 import pandas as pd
+import plotly.io as pio
 
 from agent.graph import stream_analysis
+
 
 # ── Step renderer ─────────────────────────────────────────────────────────────
 
 def _render_step(node: str, state: dict) -> None:
-    """
-    Renders a single agent step as a styled card.
-    Each node type gets a different icon so the user can
-    follow the ReAct loop visually.
-    """
+    """Renders one agent step inside the st.status() thinking panel."""
     NODE_CONFIG = {
         "planner":     ("🧠", "Plan"),
         "code_gen":    ("✍️",  "Code written"),
@@ -32,12 +30,11 @@ def _render_step(node: str, state: dict) -> None:
         "reflector":   ("🪞", "Insight"),
         "summarizer":  ("📋", "Summary"),
     }
-
     icon, label = NODE_CONFIG.get(node, ("▶️", node))
 
-    with st.expander(f"{icon} {label}", expanded=(node not in ("summarizer",))):
+    with st.expander(f"{icon} {label}", expanded=True):
         if node == "planner" and state.get("current_plan"):
-            st.markdown(f"**Next question to investigate:**\n\n{state['current_plan']}")
+            st.markdown(f"**Next question:**\n\n{state['current_plan']}")
 
         elif node == "code_gen" and state.get("current_code"):
             st.code(state["current_code"], language="python")
@@ -48,6 +45,8 @@ def _render_step(node: str, state: dict) -> None:
                 st.error(result)
             else:
                 st.code(result, language="text")
+            # Note: charts are NOT rendered here — only in the gallery below.
+            # st.plotly_chart inside st.status() causes Streamlit rendering errors.
 
         elif node == "error_fixer":
             st.warning(f"Retry attempt {state.get('error_count', '?')}/3")
@@ -82,7 +81,6 @@ with st.sidebar:
         placeholder="gsk_...",
         help="Get a free key at console.groq.com",
     )
-    # Fall back to .env if the user didn't type a key in the sidebar
     if not api_key:
         api_key = os.getenv("GROQ_API_KEY", "")
 
@@ -100,21 +98,21 @@ with st.sidebar:
         "1. Upload a CSV\n"
         "2. Agent plans → writes code → runs it → reflects\n"
         "3. Loop repeats, building insights\n"
-        "4. Final executive summary generated"
+        "4. Charts generated automatically\n"
+        "5. Final executive summary produced"
     )
     st.divider()
     st.caption("Built with LangGraph · Groq · Streamlit")
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 st.title("🔍 Autonomous Data Analyst Agent")
-st.caption("Upload a CSV. The agent writes code, runs it, fixes errors, and surfaces insights — automatically.")
+st.caption("Upload a CSV. The agent writes code, runs it, fixes errors, generates charts, and surfaces insights — automatically.")
 
 uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
 
 if uploaded_file:
-    # Preview the data so the user knows what was loaded
     df_preview = pd.read_csv(uploaded_file)
-    uploaded_file.seek(0)  # reset so it can be read again when we save to disk
+    uploaded_file.seek(0)
 
     with st.expander(f"📋 Data preview — {df_preview.shape[0]} rows × {df_preview.shape[1]} columns", expanded=True):
         st.dataframe(df_preview.head(10), use_container_width=True)
@@ -130,20 +128,14 @@ if uploaded_file:
         st.warning("Enter your Groq API key in the sidebar to run the analysis.")
 
     if run_clicked and api_key:
-        # Save upload to a temp file so our tools.py can read it from disk
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
             tmp.write(uploaded_file.read())
             tmp_path = tmp.name
 
-        # Clear previous run results from session state
         st.session_state["final_summary"] = ""
         st.session_state["insights"] = []
+        st.session_state["charts"] = []
 
-        # st.status() is the "Agent thinking..." collapsible container.
-        # - While the agent runs it shows a spinner and stays expanded.
-        # - When done it collapses with a green checkmark — same UX as ChatGPT's
-        #   "Searched X sources" or Claude's "Thinking" dropdown.
-        # - User can click it anytime to watch the internal steps.
         with st.status("🤖 Agent thinking...", expanded=True) as status:
             try:
                 for event in stream_analysis(tmp_path, max_iterations=max_iterations, api_key=api_key):
@@ -152,11 +144,12 @@ if uploaded_file:
 
                     _render_step(node, state)
 
-                    # Capture final state values
                     if node == "summarizer":
                         st.session_state["final_summary"] = state.get("final_summary", "")
                     if state.get("insights"):
                         st.session_state["insights"] = state["insights"]
+                    if state.get("charts"):
+                        st.session_state["charts"] = state["charts"]
 
                 status.update(label="✅ Analysis complete", state="complete", expanded=False)
 
@@ -166,11 +159,22 @@ if uploaded_file:
             finally:
                 os.unlink(tmp_path)
 
-        # ── Final summary — shown outside the collapsible ──────────────────
+        # ── Results outside the collapsible ───────────────────────────────
         if st.session_state.get("final_summary"):
             st.divider()
             st.subheader("📊 Executive Summary")
             st.markdown(st.session_state["final_summary"])
+
+        # Chart gallery — all charts produced during the run
+        all_charts = [c for c in st.session_state.get("charts", []) if c]
+        if all_charts:
+            st.divider()
+            st.subheader("📈 Charts")
+            cols = st.columns(min(len(all_charts), 2))
+            for i, chart_json in enumerate(all_charts):
+                with cols[i % 2]:
+                    fig = pio.from_json(chart_json)
+                    st.plotly_chart(fig, use_container_width=True)
 
         if st.session_state.get("insights"):
             st.divider()

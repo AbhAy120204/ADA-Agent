@@ -32,13 +32,14 @@ class AgentState(TypedDict):
     current_plan: str                           # What the planner decided to explore next
     current_code: str                           # Code written by code_gen
     execution_result: str                       # Output of running the code
-    insights: Annotated[list[str], operator.add]  # Accumulated findings (appends each loop)
-    iteration: int                              # How many ReAct loops we've done
-    max_iterations: int                         # Safety limit to prevent infinite loops
-    final_summary: str                          # Executive summary produced at the end
+    insights: Annotated[list[str], operator.add]     # Accumulated findings (appends each loop)
+    charts: Annotated[list[str], operator.add]       # Plotly JSON strings, one per chart produced
+    iteration: int                                   # How many ReAct loops we've done
+    max_iterations: int                              # Safety limit to prevent infinite loops
+    final_summary: str                               # Executive summary produced at the end
     # Phase 2 additions
-    error_count: int                            # Retry attempts for the current task (resets each plan)
-    last_error: str                             # Traceback from the last failed execution
+    error_count: int                                 # Retry attempts for the current task (resets each plan)
+    last_error: str                                  # Traceback from the last failed execution
 
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
@@ -54,7 +55,7 @@ def _get_llm(api_key: str | None = None) -> ChatGroq:
     load_dotenv()
     key = api_key or os.getenv("GROQ_API_KEY")
     return ChatGroq(
-        model="llama-3.1-8b-instant",
+        model="llama-3.3-70b-versatile",
         temperature=0,
         api_key=key,
     )
@@ -89,15 +90,17 @@ def planner_node(state: AgentState) -> dict:
     messages = [
         SystemMessage(content=(
             "You are a data analyst planning the next step of an exploratory analysis.\n"
-            "You will be given a summary of the dataset and insights already found.\n"
             "Output ONE specific, concrete analysis task to perform next.\n"
-            "Be specific: name the exact columns and what to compute.\n"
-            "Do NOT write code — just describe what to do in 1-2 sentences."
+            "Rules:\n"
+            "- Name the exact columns and metric to compute.\n"
+            "- Do NOT repeat or rephrase an insight already found — pick something genuinely new.\n"
+            "- Vary the angle: if you've done totals, try distributions or correlations next.\n"
+            "- Do NOT write code — describe the task in 1-2 sentences only."
         )),
         HumanMessage(content=(
             f"Dataset info:\n{state['data_summary']}\n\n"
-            f"Insights already found:\n{existing_insights}\n\n"
-            f"What should we analyze next? (iteration {state['iteration'] + 1})"
+            f"Insights already found (do NOT repeat these):\n{existing_insights}\n\n"
+            f"What NEW angle should we investigate? (iteration {state['iteration'] + 1})"
         )),
     ]
 
@@ -119,12 +122,16 @@ def code_gen_node(state: AgentState) -> dict:
 
     messages = [
         SystemMessage(content=(
-            "You are a Python data analyst. Write clean pandas code to complete the task.\n"
+            "You are a Python data analyst. Write clean code to complete the task.\n"
+            "Available variables: `df` (DataFrame), `pd` (pandas), `px` (plotly.express), `go` (plotly.graph_objects).\n"
             "Rules:\n"
-            "- The variable `df` contains the DataFrame. `pd` is already imported.\n"
-            "- Use print() for ALL output — this is how results are captured.\n"
+            "- Use print() for ALL text output — this is how results are captured.\n"
+            "- If the task involves a distribution, comparison, trend, or ranking across multiple values, create a Plotly chart.\n"
+            "- Do NOT create a chart for a single scalar value (e.g. one correlation number, one mean).\n"
+            "- For charts: assign the figure to a variable named exactly `fig` (e.g. fig = px.bar(...)).\n"
+            "- Do NOT call fig.show() — just assign to `fig`.\n"
             "- Write ONLY the code block, no markdown fences, no explanation.\n"
-            "- Keep it short and focused on the task."
+            "- Always print key numeric results even when you also create a chart."
         )),
         HumanMessage(content=(
             f"Dataset columns and types:\n{state['data_summary']}\n\n"
@@ -145,15 +152,27 @@ def code_gen_node(state: AgentState) -> dict:
 
 def executor_node(state: AgentState) -> dict:
     """
-    Runs the generated code and captures the output.
-    Now stores the raw error in last_error so error_fixer can read it.
+    Runs generated code, captures stdout, and extracts any Plotly figure.
+    run_python_code now returns a CodeResult object with .output and .chart_json.
     """
     result = run_python_code(state["current_code"])
-    print(f"\n[EXECUTOR]\n{result}")
+    print(f"\n[EXECUTOR]\n{result.output}")
+    if result.chart_json:
+        print("[EXECUTOR] Chart generated.")
 
     if result.startswith("ERROR:"):
-        return {"execution_result": result, "last_error": result}
-    return {"execution_result": result, "last_error": ""}
+        return {
+            "execution_result": result.output,
+            "last_error": result.output,
+            "charts": [],
+        }
+
+    new_charts = [result.chart_json] if result.chart_json else []
+    return {
+        "execution_result": result.output,
+        "last_error": "",
+        "charts": new_charts,   # appended to state["charts"] via Annotated operator.add
+    }
 
 
 # ── Node 3b: Error Fixer ──────────────────────────────────────────────────────
@@ -180,8 +199,10 @@ def error_fixer_node(state: AgentState) -> dict:
             "You are a Python debugging expert. A pandas code snippet failed.\n"
             "Your job: rewrite the code to fix the error.\n"
             "Rules:\n"
-            "- The variable `df` contains the DataFrame. `pd` is already imported.\n"
-            "- Use print() for ALL output.\n"
+            "- Available variables: `df` (DataFrame), `pd` (pandas), `px` (plotly.express), `go` (plotly.graph_objects).\n"
+            "- Use print() for ALL text output.\n"
+            "- If the original code created a chart, keep the chart in the fixed version. Assign it to `fig`.\n"
+            "- Do NOT call fig.show() — just assign to `fig`.\n"
             "- Write ONLY the fixed code, no markdown fences, no explanation.\n"
             "- Keep the same analysis goal, just fix the bug."
         )),
@@ -366,6 +387,7 @@ def _build_initial_state(file_path: str, max_iterations: int) -> AgentState:
         "current_code": "",
         "execution_result": "",
         "insights": [],
+        "charts": [],
         "iteration": 0,
         "max_iterations": max_iterations,
         "final_summary": "",
