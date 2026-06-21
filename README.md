@@ -6,7 +6,8 @@
 
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://autonomous-data-analyst-agent-hun39rzqecosyvx5pqu3rg.streamlit.app/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-ReAct%20Loop-1C3C3C?style=for-the-badge&logo=chainlink&logoColor=white)](https://github.com/langchain-ai/langgraph)
-[![Groq](https://img.shields.io/badge/Groq-llama--3.1--8b-F55036?style=for-the-badge&logo=lightning&logoColor=white)](https://console.groq.com)
+[![Groq](https://img.shields.io/badge/Groq-llama--3.3--70b-F55036?style=for-the-badge&logo=lightning&logoColor=white)](https://console.groq.com)
+[![LangSmith](https://img.shields.io/badge/LangSmith-Tracing-FF6B35?style=for-the-badge&logo=chainlink&logoColor=white)](https://smith.langchain.com/public/5972260a-6105-4822-b5dd-7699bdea0dff/r)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 
 </div>
@@ -63,6 +64,31 @@ The UI shows the agent's internal reasoning in real time — collapsed by defaul
 
 ---
 
+## LangSmith observability
+
+Every run can be traced end-to-end through LangSmith. Each node in the graph appears as a span — you can inspect the exact prompt sent, the model's response, token counts, and latency for every LLM call in the loop.
+
+**👉 [View a live sample trace](https://smith.langchain.com/public/5972260a-6105-4822-b5dd-7699bdea0dff/r)**
+
+What the trace shows:
+
+```
+▶ RunnableSequence                          (full agent run)
+  ├─ planner          ~1.2s   420 tokens   "Analyze revenue by region..."
+  ├─ code_gen         ~0.9s   310 tokens   df.groupby('region')['revenue']...
+  ├─ executor         —       —            Code ran, no LLM call
+  ├─ reflector        ~0.7s   180 tokens   "INSIGHT: North leads with $..."
+  ├─ planner          ~1.1s   510 tokens   "Next: distribution of order sizes"
+  ├─ code_gen         ~0.8s   290 tokens   px.histogram(df, x='order_value')
+  ├─ executor         —       —            Chart generated
+  ├─ reflector        ~0.7s   160 tokens   "INSIGHT: Orders cluster around..."
+  └─ summarizer       ~1.5s   620 tokens   "Key Findings: ..."
+```
+
+To enable tracing in the app, expand **LangSmith Tracing** in the sidebar and paste your API key from [smith.langchain.com](https://smith.langchain.com). Traces appear in your project under **Projects → ada-agent → Runs** after each run.
+
+---
+
 ## Why this is hard to build (and why it matters)
 
 | Naive approach | This agent |
@@ -79,9 +105,11 @@ The UI shows the agent's internal reasoning in real time — collapsed by defaul
 
 ```
 Agent orchestration  →  LangGraph (StateGraph with conditional edges)
-LLM inference        →  Groq API  (llama-3.1-8b-instant, free tier)
+LLM inference        →  Groq API  (llama-3.3-70b-versatile)
 Code execution       →  Python exec() in isolated namespace with stdout capture
 Data manipulation    →  Pandas
+Charts               →  Plotly (auto-generated, embedded in results)
+Observability        →  LangSmith (token counts + full trace per run)
 UI + deployment      →  Streamlit Community Cloud
 ```
 
@@ -132,10 +160,11 @@ python main.py --file data/examples/sales.csv --iterations 5
 - [x] Phase 1 — Core ReAct loop (plan → code → execute → reflect)
 - [x] Phase 2 — Error recovery (auto-fix broken code, 3 retries)
 - [x] Phase 3 — Streamlit UI with live streaming
-- [ ] Phase 4 — Plotly chart generation
+- [x] Phase 4 — Plotly chart generation (auto-generated, embedded in results)
+- [x] Phase 6 — Token counter + LangSmith tracing
 - [ ] Phase 5 — SQL / database support
-- [ ] Phase 6 — Eval framework + LLM observability
 - [ ] Phase 7 — Multi-model BYOK (Groq / Gemini / Ollama)
+- [ ] Phase 8 — Test against competitors
 
 ---
 

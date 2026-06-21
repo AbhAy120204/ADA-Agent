@@ -19,12 +19,18 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
-from agent.tools import load_csv, run_python_code, get_dataframe_info
+from agent.tools import load_csv, run_python_code
 
 
 # ── State definition ──────────────────────────────────────────────────────────
 # TypedDict tells LangGraph exactly what fields live in the state.
 # Annotated[list, operator.add] means "append to this list" instead of replacing it.
+
+class TokenUsage(TypedDict):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
 
 class AgentState(TypedDict):
     file_path: str                              # CSV path provided by user
@@ -40,6 +46,8 @@ class AgentState(TypedDict):
     # Phase 2 additions
     error_count: int                                 # Retry attempts for the current task (resets each plan)
     last_error: str                                  # Traceback from the last failed execution
+    # Phase 6 additions
+    token_usage: TokenUsage                          # Cumulative token counts across all LLM calls
 
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
@@ -76,6 +84,16 @@ def _llm() -> ChatGroq:
     return _get_llm(_runtime_api_key)
 
 
+def _add_tokens(current: TokenUsage, response) -> TokenUsage:
+    """Accumulate token counts from a LangChain response's usage_metadata."""
+    meta = getattr(response, "usage_metadata", None) or {}
+    return {
+        "prompt_tokens":     current["prompt_tokens"]     + meta.get("input_tokens", 0),
+        "completion_tokens": current["completion_tokens"] + meta.get("output_tokens", 0),
+        "total_tokens":      current["total_tokens"]      + meta.get("total_tokens", 0),
+    }
+
+
 # ── Node 1: Planner ───────────────────────────────────────────────────────────
 
 def planner_node(state: AgentState) -> dict:
@@ -107,8 +125,12 @@ def planner_node(state: AgentState) -> dict:
     response = llm.invoke(messages)
     plan = response.content.strip()
     print(f"\n[PLANNER] → {plan}")
-    # Reset error counter — each new plan gets 3 fresh retry attempts
-    return {"current_plan": plan, "error_count": 0, "last_error": ""}
+    return {
+        "current_plan": plan,
+        "error_count": 0,
+        "last_error": "",
+        "token_usage": _add_tokens(state["token_usage"], response),
+    }
 
 
 # ── Node 2: Code Generator ────────────────────────────────────────────────────
@@ -140,12 +162,14 @@ def code_gen_node(state: AgentState) -> dict:
     ]
 
     response = llm.invoke(messages)
-    # Strip any accidental markdown code fences the LLM might add
     code = response.content.strip()
     code = code.removeprefix("```python").removeprefix("```").removesuffix("```").strip()
 
     print(f"\n[CODE GEN]\n{code}")
-    return {"current_code": code}
+    return {
+        "current_code": code,
+        "token_usage": _add_tokens(state["token_usage"], response),
+    }
 
 
 # ── Node 3: Executor ──────────────────────────────────────────────────────────
@@ -222,6 +246,7 @@ def error_fixer_node(state: AgentState) -> dict:
     return {
         "current_code": fixed_code,
         "error_count": state["error_count"] + 1,
+        "token_usage": _add_tokens(state["token_usage"], response),
     }
 
 
@@ -282,8 +307,9 @@ def reflector_node(state: AgentState) -> dict:
     print(f"\n[REFLECTOR] → {insight}")
 
     return {
-        "insights": [insight],               # appended to the list (see Annotated above)
+        "insights": [insight],
         "iteration": state["iteration"] + 1,
+        "token_usage": _add_tokens(state["token_usage"], response),
     }
 
 
@@ -314,7 +340,10 @@ def summarizer_node(state: AgentState) -> dict:
     response = llm.invoke(messages)
     summary = response.content.strip()
     print(f"\n{'='*60}\n[FINAL SUMMARY]\n{summary}\n{'='*60}")
-    return {"final_summary": summary}
+    return {
+        "final_summary": summary,
+        "token_usage": _add_tokens(state["token_usage"], response),
+    }
 
 
 # ── Routing logic ─────────────────────────────────────────────────────────────
@@ -393,6 +422,7 @@ def _build_initial_state(file_path: str, max_iterations: int) -> AgentState:
         "final_summary": "",
         "error_count": 0,
         "last_error": "",
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 

@@ -18,6 +18,18 @@ import plotly.io as pio
 from agent.graph import stream_analysis
 
 
+def _setup_langsmith(api_key: str, project: str) -> None:
+    """Set LangSmith env vars so LangChain auto-traces the run."""
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = api_key
+    os.environ["LANGCHAIN_PROJECT"] = project
+    os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+
+
+def _teardown_langsmith() -> None:
+    os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
+
 # ── Step renderer ─────────────────────────────────────────────────────────────
 
 def _render_step(node: str, state: dict) -> None:
@@ -93,6 +105,19 @@ with st.sidebar:
     )
 
     st.divider()
+    with st.expander("🔭 LangSmith Tracing (optional)"):
+        langsmith_key = st.text_input(
+            "LangSmith API Key",
+            type="password",
+            placeholder="lsv2_...",
+            help="Get a free key at smith.langchain.com",
+        )
+        langsmith_project = st.text_input(
+            "Project name",
+            value="ada-agent",
+            help="Traces will appear under this project in LangSmith",
+        )
+    st.divider()
     st.markdown(
         "**How it works**\n\n"
         "1. Upload a CSV\n"
@@ -135,6 +160,10 @@ if uploaded_file:
         st.session_state["final_summary"] = ""
         st.session_state["insights"] = []
         st.session_state["charts"] = []
+        st.session_state["token_usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        if langsmith_key:
+            _setup_langsmith(langsmith_key, langsmith_project)
 
         with st.status("🤖 Agent thinking...", expanded=True) as status:
             try:
@@ -150,6 +179,8 @@ if uploaded_file:
                         st.session_state["insights"] = state["insights"]
                     if state.get("charts"):
                         st.session_state["charts"] = state["charts"]
+                    if state.get("token_usage"):
+                        st.session_state["token_usage"] = state["token_usage"]
 
                 status.update(label="✅ Analysis complete", state="complete", expanded=False)
 
@@ -158,6 +189,26 @@ if uploaded_file:
                 st.error(f"{e}")
             finally:
                 os.unlink(tmp_path)
+                if langsmith_key:
+                    _teardown_langsmith()
+
+        # ── Token usage ───────────────────────────────────────────────────
+        usage = st.session_state.get("token_usage", {})
+        if usage.get("total_tokens"):
+            st.divider()
+            st.subheader("🔢 Token Usage")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Prompt tokens",     f"{usage['prompt_tokens']:,}")
+            c2.metric("Completion tokens", f"{usage['completion_tokens']:,}")
+            c3.metric("Total tokens",      f"{usage['total_tokens']:,}")
+
+        # ── LangSmith trace link ───────────────────────────────────────────
+        if langsmith_key:
+            st.info(
+                f"🔭 Traces available in LangSmith project **{langsmith_project}** — "
+                "[open dashboard](https://smith.langchain.com)",
+                icon="🔗",
+            )
 
         # ── Results outside the collapsible ───────────────────────────────
         if st.session_state.get("final_summary"):
