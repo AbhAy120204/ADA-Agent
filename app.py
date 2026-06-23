@@ -87,14 +87,42 @@ st.set_page_config(
 with st.sidebar:
     st.title("⚙️ Configuration")
 
+    PROVIDER_CONFIG = {
+        "Groq": {
+            "id": "groq",
+            "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+            "key_placeholder": "gsk_...",
+            "key_help": "Get a free key at console.groq.com",
+            "env_var": "GROQ_API_KEY",
+        },
+        "Gemini": {
+            "id": "gemini",
+            "models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+            "key_placeholder": "AIza...",
+            "key_help": "Get a free key at aistudio.google.com",
+            "env_var": "GOOGLE_API_KEY",
+        },
+    }
+
+    provider_label = st.selectbox("Provider", list(PROVIDER_CONFIG.keys()), index=0)
+    provider_cfg = PROVIDER_CONFIG[provider_label]
+    provider = provider_cfg["id"]
+
     api_key = st.text_input(
-        "Groq API Key",
+        f"{provider_label} API Key",
         type="password",
-        placeholder="gsk_...",
-        help="Get a free key at console.groq.com",
+        placeholder=provider_cfg["key_placeholder"],
+        help=provider_cfg["key_help"],
     )
     if not api_key:
-        api_key = os.getenv("GROQ_API_KEY", "")
+        api_key = os.getenv(provider_cfg["env_var"], "")
+
+    model = st.selectbox(
+        "Model",
+        provider_cfg["models"],
+        index=0,
+        help="Smaller models are faster and cheaper; larger ones produce better analysis.",
+    )
 
     max_iterations = st.slider(
         "Analysis depth (iterations)",
@@ -150,7 +178,7 @@ if uploaded_file:
 
     run_clicked = st.button("🚀 Run Analysis", type="primary", disabled=not api_key)
     if not api_key:
-        st.warning("Enter your Groq API key in the sidebar to run the analysis.")
+        st.warning(f"Enter your {provider_label} API key in the sidebar to run the analysis.")
 
     if run_clicked and api_key:
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -167,7 +195,13 @@ if uploaded_file:
 
         with st.status("🤖 Agent thinking...", expanded=True) as status:
             try:
-                for event in stream_analysis(tmp_path, max_iterations=max_iterations, api_key=api_key):
+                for event in stream_analysis(
+                    tmp_path,
+                    max_iterations=max_iterations,
+                    provider=provider,
+                    api_key=api_key,
+                    model=model,
+                ):
                     node = event["node"]
                     state = event["state"]
 

@@ -15,7 +15,7 @@ Why a dedicated error_fixer node instead of retrying inside executor?
 from typing import TypedDict, Annotated
 import operator
 
-from langchain_groq import ChatGroq
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
@@ -52,36 +52,51 @@ class AgentState(TypedDict):
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
 
-def _get_llm(api_key: str | None = None) -> ChatGroq:
+# Default model per provider — can be overridden from the UI
+DEFAULT_MODELS = {
+    "groq":   "llama-3.3-70b-versatile",
+    "gemini": "gemini-2.0-flash",
+}
+
+
+def _get_llm(provider: str = "groq", api_key: str | None = None, model: str | None = None) -> BaseChatModel:
     """
-    Returns a Groq LLM.
-    api_key: if provided (from Streamlit sidebar), uses it directly.
-             Otherwise falls back to GROQ_API_KEY env variable.
+    Build a LangChain chat model for the chosen provider.
+
+    Lazy imports keep the heavy provider SDKs optional — Streamlit Cloud only
+    needs whichever provider the user actually picks.
     """
     import os
     from dotenv import load_dotenv
     load_dotenv()
-    key = api_key or os.getenv("GROQ_API_KEY")
-    return ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=0,
-        api_key=key,
-    )
+
+    model = model or DEFAULT_MODELS.get(provider)
+
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        key = api_key or os.getenv("GROQ_API_KEY")
+        return ChatGroq(model=model, temperature=0, api_key=key)
+
+    if provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        key = api_key or os.getenv("GOOGLE_API_KEY")
+        return ChatGoogleGenerativeAI(model=model, temperature=0, google_api_key=key)
+
+    raise ValueError(f"Unknown provider: {provider!r}. Supported: groq, gemini.")
 
 
-# Module-level key store so all nodes in a run share the same key
-_runtime_api_key: str | None = None
+# Module-level config so all nodes in a run share the same provider/key/model
+_runtime_config: dict = {"provider": "groq", "api_key": None, "model": None}
 
 
-def set_api_key(key: str) -> None:
-    """Called by Streamlit before starting a run to set the user's key."""
-    global _runtime_api_key
-    _runtime_api_key = key
+def set_llm_config(provider: str, api_key: str | None, model: str | None = None) -> None:
+    """Called by Streamlit before starting a run."""
+    _runtime_config.update({"provider": provider, "api_key": api_key, "model": model})
 
 
-def _llm() -> ChatGroq:
-    """Shorthand used by all nodes — picks up the runtime key if set."""
-    return _get_llm(_runtime_api_key)
+def _llm() -> BaseChatModel:
+    """Shorthand used by all nodes — picks up the runtime config."""
+    return _get_llm(**_runtime_config)
 
 
 def _add_tokens(current: TokenUsage, response) -> TokenUsage:
@@ -426,7 +441,13 @@ def _build_initial_state(file_path: str, max_iterations: int) -> AgentState:
     }
 
 
-def stream_analysis(file_path: str, max_iterations: int = 5, api_key: str | None = None):
+def stream_analysis(
+    file_path: str,
+    max_iterations: int = 5,
+    provider: str = "groq",
+    api_key: str | None = None,
+    model: str | None = None,
+):
     """
     Generator used by Streamlit for live updates.
 
@@ -440,8 +461,7 @@ def stream_analysis(file_path: str, max_iterations: int = 5, api_key: str | None
       {"node": "code_gen", "state": {...}}
       ...
     """
-    if api_key:
-        set_api_key(api_key)
+    set_llm_config(provider, api_key, model)
 
     initial_state = _build_initial_state(file_path, max_iterations)
     graph = build_graph()
@@ -453,8 +473,15 @@ def stream_analysis(file_path: str, max_iterations: int = 5, api_key: str | None
         yield {"node": node_name, "state": state}
 
 
-def run_analysis(file_path: str, max_iterations: int = 5) -> dict:
+def run_analysis(
+    file_path: str,
+    max_iterations: int = 5,
+    provider: str = "groq",
+    api_key: str | None = None,
+    model: str | None = None,
+) -> dict:
     """CLI entry point — blocks until complete, returns final state."""
+    set_llm_config(provider, api_key, model)
     initial_state = _build_initial_state(file_path, max_iterations)
     print(f"[INIT] {initial_state['data_summary']}\n")
     graph = build_graph()
