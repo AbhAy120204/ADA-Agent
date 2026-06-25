@@ -162,9 +162,8 @@ python main.py --file data/examples/sales.csv --iterations 5
 - [x] Phase 3 — Streamlit UI with live streaming
 - [x] Phase 4 — Plotly chart generation (auto-generated, embedded in results)
 - [x] Phase 6 — Token counter + LangSmith tracing
+- [x] Phase 7 — Multi-model BYOK (Groq / Gemini)
 - [ ] Phase 5 — SQL / database support
-- [ ] Phase 7 — Multi-model BYOK (Groq / Gemini / Ollama)
-- [ ] Phase 8 — Test against competitors
 
 ---
 
