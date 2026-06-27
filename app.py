@@ -35,17 +35,38 @@ def _teardown_langsmith() -> None:
 def _render_step(node: str, state: dict) -> None:
     """Renders one agent step inside the st.status() thinking panel."""
     NODE_CONFIG = {
-        "planner":     ("🧠", "Plan"),
-        "code_gen":    ("✍️",  "Code written"),
-        "executor":    ("⚙️",  "Executed"),
-        "error_fixer": ("🔧", "Fixing error"),
-        "reflector":   ("🪞", "Insight"),
-        "summarizer":  ("📋", "Summary"),
+        "sanitizer":       ("🔬", "Data Quality Check"),
+        "sanitizer_store": ("📋", "Data Quality Report"),
+        "planner":         ("🧠", "Plan"),
+        "code_gen":        ("✍️",  "Code written"),
+        "executor":        ("⚙️",  "Executed"),
+        "error_fixer":     ("🔧", "Fixing error"),
+        "reflector":       ("🪞", "Insight"),
+        "summarizer":      ("📋", "Summary"),
     }
     icon, label = NODE_CONFIG.get(node, ("▶️", node))
 
     with st.expander(f"{icon} {label}", expanded=True):
-        if node == "planner" and state.get("current_plan"):
+        if node == "sanitizer":
+            st.info("Running data quality inspection...")
+
+        elif node == "sanitizer_store":
+            report = state.get("data_quality_report", "")
+            if report:
+                lines = report.splitlines()
+                high   = sum(1 for l in lines if "[HIGH]"   in l)
+                medium = sum(1 for l in lines if "[MEDIUM]" in l)
+                low    = sum(1 for l in lines if "[LOW]"    in l)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("🔴 High",   high)
+                c2.metric("🟡 Medium", medium)
+                c3.metric("🔵 Low",    low)
+                with st.expander("View full report", expanded=False):
+                    st.code(report, language="text")
+            else:
+                st.success("No data quality issues detected.")
+
+        elif node == "planner" and state.get("current_plan"):
             st.markdown(f"**Next question:**\n\n{state['current_plan']}")
 
         elif node == "code_gen" and state.get("current_code"):
@@ -189,6 +210,7 @@ if uploaded_file:
         st.session_state["insights"] = []
         st.session_state["charts"] = []
         st.session_state["token_usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        st.session_state["data_quality_report"] = ""
 
         if langsmith_key:
             _setup_langsmith(langsmith_key, langsmith_project)
@@ -215,6 +237,8 @@ if uploaded_file:
                         st.session_state["charts"] = state["charts"]
                     if state.get("token_usage"):
                         st.session_state["token_usage"] = state["token_usage"]
+                    if node == "sanitizer_store" and state.get("data_quality_report"):
+                        st.session_state["data_quality_report"] = state["data_quality_report"]
 
                 status.update(label="✅ Analysis complete", state="complete", expanded=False)
 

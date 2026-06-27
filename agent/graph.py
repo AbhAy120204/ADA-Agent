@@ -1,15 +1,21 @@
 """
 The ReAct loop implemented as a LangGraph StateGraph.
 
-Node flow (Phase 2):
+Node flow:
+  sanitizer ──→ code_gen → executor ──success──→ sanitizer_store ──→ planner
+                                └──error──→ error_fixer → executor (retry, max 3x)
+                                                  └──3rd failure──→ sanitizer_store
+
   planner → code_gen → executor ──success──→ reflector → (planner OR summarizer)
                             └──error──→ error_fixer → executor (retry, max 3x)
                                               └──3rd failure──→ reflector anyway
 
-Why a dedicated error_fixer node instead of retrying inside executor?
-  Separation of concerns: executor just runs code and reports.
-  error_fixer is the only place that knows about retries — it holds the
-  error_count state and the traceback. Clean to test, clean to extend.
+sanitizer: zero-LLM task-setter. Writes a fixed DQ inspection task into
+  current_plan and sets phase="sanitizing". code_gen/executor/error_fixer
+  are reused 100%. sanitizer_store captures the result into data_quality_report
+  and flips phase to "analyzing" before handing off to planner.
+  after_executor reads phase to route sanitizing runs to sanitizer_store
+  instead of reflector.
 """
 
 from typing import TypedDict, Annotated
@@ -48,6 +54,9 @@ class AgentState(TypedDict):
     last_error: str                                  # Traceback from the last failed execution
     # Phase 6 additions
     token_usage: TokenUsage                          # Cumulative token counts across all LLM calls
+    # Phase 8 additions
+    data_quality_report: str                         # Output of sanitizer run — injected into all downstream prompts
+    phase: str                                       # "sanitizing" | "analyzing" — controls executor routing
 
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
@@ -109,6 +118,56 @@ def _add_tokens(current: TokenUsage, response) -> TokenUsage:
     }
 
 
+# ── Node 0: Sanitizer ────────────────────────────────────────────────────────
+
+_SANITIZER_PLAN = (
+    "DATA QUALITY CHECK — inspect the DataFrame and print a structured report covering:\n"
+    "1. Null/missing values per column (count + % of rows)\n"
+    "2. Mixed-type columns where numeric parsing fails "
+    "(currency symbols, text like 'ten', Excel errors '#VALUE!', '#REF!')\n"
+    "3. Negative values in columns that should be non-negative\n"
+    "4. Statistical outliers: Z-score > 3, report count and worst value per numeric column\n"
+    "5. columns outside sensible range then what the heading suggests\n"
+    "6. Dirty categoricals: leading/trailing spaces, ALL-CAPS variants, "
+    "Excel error strings, near-duplicate names\n"
+    "Print [HIGH], [MEDIUM], or [LOW] before each finding. Skip clean columns. "
+    "End with a SUMMARY paragraph. "
+    "IMPORTANT: always use errors='coerce' with pd.to_numeric(); "
+    "always dropna() and guard with isinstance(v, str) before string ops on object columns."
+)
+
+
+def sanitizer_node(state: AgentState) -> dict:
+    """
+    Zero-LLM task-setter. Injects the fixed DQ inspection task into current_plan
+    and marks phase='sanitizing'. code_gen, executor, and error_fixer are all
+    reused unchanged. sanitizer_store_node captures the result afterward.
+    """
+    print("\n[SANITIZER] Queuing data quality inspection task...")
+    return {
+        "current_plan": _SANITIZER_PLAN,
+        "phase": "sanitizing",
+        "error_count": 0,
+        "last_error": "",
+    }
+
+
+# ── Node 0b: Sanitizer Store ──────────────────────────────────────────────────
+
+def sanitizer_store_node(state: AgentState) -> dict:
+    """
+    Runs after executor finishes the DQ inspection (phase='sanitizing').
+    Copies execution_result → data_quality_report and flips phase → 'analyzing'
+    so after_executor routes to reflector for all subsequent iterations.
+    """
+    report = state.get("execution_result", "")
+    print(f"\n[SANITIZER STORE] Report captured ({len(report)} chars). Handing off to planner.")
+    return {
+        "data_quality_report": report,
+        "phase": "analyzing",
+    }
+
+
 # ── Node 1: Planner ───────────────────────────────────────────────────────────
 
 def planner_node(state: AgentState) -> dict:
@@ -119,6 +178,8 @@ def planner_node(state: AgentState) -> dict:
     llm = _llm()
 
     existing_insights = "\n".join(state["insights"]) if state["insights"] else "None yet."
+    dqr = state.get("data_quality_report", "")
+    dqr_section = f"\nData quality issues found by sanitizer (account for these):\n{dqr}\n" if dqr else ""
 
     messages = [
         SystemMessage(content=(
@@ -128,10 +189,13 @@ def planner_node(state: AgentState) -> dict:
             "- Name the exact columns and metric to compute.\n"
             "- Do NOT repeat or rephrase an insight already found — pick something genuinely new.\n"
             "- Vary the angle: if you've done totals, try distributions or correlations next.\n"
+            "- If data quality issues are listed below, plan tasks that work around them "
+            "(e.g. filter outliers before aggregating, normalize rates before binning).\n"
             "- Do NOT write code — describe the task in 1-2 sentences only."
         )),
         HumanMessage(content=(
-            f"Dataset info:\n{state['data_summary']}\n\n"
+            f"Dataset info:\n{state['data_summary']}\n"
+            f"{dqr_section}\n"
             f"Insights already found (do NOT repeat these):\n{existing_insights}\n\n"
             f"What NEW angle should we investigate? (iteration {state['iteration'] + 1})"
         )),
@@ -157,6 +221,9 @@ def code_gen_node(state: AgentState) -> dict:
     """
     llm = _llm()
 
+    dqr = state.get("data_quality_report", "")
+    dqr_section = f"\nKnown data quality issues (sanitizer report):\n{dqr}\n" if dqr else ""
+
     messages = [
         SystemMessage(content=(
             "You are a Python data analyst. Write clean code to complete the task.\n"
@@ -168,10 +235,14 @@ def code_gen_node(state: AgentState) -> dict:
             "- For charts: assign the figure to a variable named exactly `fig` (e.g. fig = px.bar(...)).\n"
             "- Do NOT call fig.show() — just assign to `fig`.\n"
             "- Write ONLY the code block, no markdown fences, no explanation.\n"
-            "- Always print key numeric results even when you also create a chart."
+            "- Always print key numeric results even when you also create a chart.\n"
+            "- If data quality issues are listed below, your code MUST handle them: "
+            "coerce types, filter outliers before charting, normalize rates, "
+            "strip whitespace from categoricals."
         )),
         HumanMessage(content=(
-            f"Dataset columns and types:\n{state['data_summary']}\n\n"
+            f"Dataset columns and types:\n{state['data_summary']}\n"
+            f"{dqr_section}\n"
             f"Task: {state['current_plan']}"
         )),
     ]
@@ -282,13 +353,17 @@ def after_executor(state: AgentState) -> str:
     is_error = state["execution_result"].startswith("ERROR:")
 
     if not is_error:
+        if state.get("phase") == "sanitizing":
+            return "sanitizer_store"
         return "reflector"
 
     if state["error_count"] < MAX_RETRIES:
         return "error_fixer"
 
-    # Exhausted retries — send to reflector which will log this as an ERROR insight
+    # Exhausted retries — store or reflect depending on phase
     print(f"\n[ROUTER] Max retries reached for this task. Moving on.")
+    if state.get("phase") == "sanitizing":
+        return "sanitizer_store"
     return "reflector"
 
 
@@ -339,15 +414,24 @@ def summarizer_node(state: AgentState) -> dict:
 
     insights_text = "\n".join(state["insights"])
 
+    dqr = state.get("data_quality_report", "")
+    dqr_section = (
+        f"\nData quality caveats identified before analysis:\n{dqr}\n"
+        if dqr else ""
+    )
+
     messages = [
         SystemMessage(content=(
             "You are a senior data analyst writing an executive summary.\n"
             "Synthesize the findings into a clear, structured report.\n"
             "Use sections: Key Findings, Notable Patterns, Recommendations.\n"
+            "If data quality caveats are provided, add a brief 'Data Quality Caveats' "
+            "section at the end noting which findings may be affected.\n"
             "Be concise — 200-300 words max."
         )),
         HumanMessage(content=(
-            f"Dataset: {state['file_path']}\n\n"
+            f"Dataset: {state['file_path']}\n"
+            f"{dqr_section}\n"
             f"Analysis findings:\n{insights_text}"
         )),
     ]
@@ -384,7 +468,8 @@ def should_continue(state: AgentState) -> str:
 def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
-    # Register all nodes (error_fixer is new in Phase 2)
+    graph.add_node("sanitizer", sanitizer_node)
+    graph.add_node("sanitizer_store", sanitizer_store_node)
     graph.add_node("planner", planner_node)
     graph.add_node("code_gen", code_gen_node)
     graph.add_node("executor", executor_node)
@@ -393,17 +478,20 @@ def build_graph() -> StateGraph:
     graph.add_node("summarizer", summarizer_node)
 
     # Fixed edges
-    graph.set_entry_point("planner")
+    graph.set_entry_point("sanitizer")
+    graph.add_edge("sanitizer", "code_gen")      # task-setter goes straight to code_gen
+    graph.add_edge("sanitizer_store", "planner") # DQ report stored → begin analysis
     graph.add_edge("planner", "code_gen")
     graph.add_edge("code_gen", "executor")
-    graph.add_edge("error_fixer", "executor")  # fixer always goes back to executor
+    graph.add_edge("error_fixer", "executor")    # fixer always goes back to executor
     graph.add_edge("summarizer", END)
 
-    # Phase 2: executor now routes conditionally (was a fixed edge in Phase 1)
+    # executor routes conditionally (phase-aware)
     graph.add_conditional_edges(
         "executor",
         after_executor,
         {
+            "sanitizer_store": "sanitizer_store",
             "reflector": "reflector",
             "error_fixer": "error_fixer",
         },
@@ -438,6 +526,8 @@ def _build_initial_state(file_path: str, max_iterations: int) -> AgentState:
         "error_count": 0,
         "last_error": "",
         "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "data_quality_report": "",
+        "phase": "sanitizing",
     }
 
 
